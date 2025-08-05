@@ -7,11 +7,14 @@ OneBot V11 协议的群聊申请交互式审核机器人 (生产环境优化版)
 功能:
 1. 监听指定群聊的加群申请事件。
 2. 如果申请者的验证消息匹配预设的“暗号”，则自动通过。
-3. 如果不匹配，则将申请详情转发到指定的管理员群，由管理员通过指令进行审核。
-4. 管理员可以在群内通过 @机器人 并使用指令 (`/a` 接受, `/d` 拒绝) 来处理申请。
-5. 定期自动同步待处理请求的状态，清理已被手动处理或已入群的申请，防止状态不一致。
-6. 强大的自动重试机制，应对网络波动，极大减少人工干预。
-7. 全异步I/O，性能更佳。
+3. 支持两种验证消息模式：
+   - 普通模式：直接匹配验证消息全文。
+   - 问题模式：当QQ群设置为“回答问题”时，自动提取“答案：”后的内容进行匹配。
+4. 如果不匹配，则将申请详情转发到指定的管理员群，由管理员通过指令进行审核。
+5. 管理员可以在群内通过 @机器人 并使用指令 (`/a` 接受, `/d` 拒绝) 来处理申请。
+6. 定期自动同步待处理请求的状态，清理已被手动处理或已入群的申请，防止状态不一致。
+7. 强大的自动重试机制，应对网络波动，极大减少人工干预。
+8. 全异步I/O，性能更佳。
 
 """
 
@@ -40,22 +43,30 @@ class Config:
     websocket_uri: str = os.getenv("WEBSOCKET_URI", "ws://127.0.0.1:3001")
     onebot_http_api_url: str = os.getenv("ONEBOT_HTTP_API_URL", "http://127.0.0.1:3000")
     
-    # 使用 post_init 处理列表类型的环境变量
-    target_group_ids_str: str = os.getenv("TARGET_GROUP_IDS", "")
-    admin_group_ids_str: str = os.getenv("ADMIN_GROUP_IDS", "")
+    # 使用 post_init 处理列表和布尔类型的环境变量
+    target_group_ids_str: str = os.getenv("TARGET_GROUP_IDS", "00000000")
+    admin_group_ids_str: str = os.getenv("ADMIN_GROUP_IDS", "00000000")
     allowed_comments_str: str = os.getenv("ALLOWED_COMMENTS", "喵喵喵,v我50,我是natsuki")
     
+    # 问题模式开关
+    question_mode_enabled_str: str = os.getenv("QUESTION_MODE_ENABLED", "false")
+
     target_group_ids: List[int] = field(default_factory=list, init=False)
     admin_group_ids: List[int] = field(default_factory=list, init=False)
     allowed_comments: List[str] = field(default_factory=list, init=False)
+    question_mode_enabled: bool = field(default=False, init=False)
 
     state_sync_interval_seconds: int = int(os.getenv("STATE_SYNC_INTERVAL_SECONDS", "600"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
     def __post_init__(self):
+        """在初始化后处理环境变量字符串，转换为正确的类型。"""
         self.target_group_ids = self._parse_int_list(self.target_group_ids_str)
         self.admin_group_ids = self._parse_int_list(self.admin_group_ids_str)
         self.allowed_comments = [item.strip() for item in self.allowed_comments_str.split(',') if item.strip()]
+        
+        # 将字符串 'true', '1', 'yes' (不区分大小写) 解析为布尔值 True
+        self.question_mode_enabled = self.question_mode_enabled_str.lower() in ('true', '1', 'yes')
         
         # 启动前进行配置检查，提供明确的警告
         if not self.target_group_ids:
@@ -179,6 +190,36 @@ def parse_command(text: str) -> Optional[Tuple[str, Dict[str, str]]]:
             
     return command, params
 
+# 新增：辅助函数，用于从验证消息中提取有效答案
+def extract_answer_from_comment(comment: str, is_question_mode: bool) -> str:
+    """
+    根据是否启用问题模式，从验证消息中提取用于匹配的答案。
+
+    Args:
+        comment: 原始的验证消息字符串。
+        is_question_mode: 是否启用了问题模式的布尔标志。
+
+    Returns:
+        用于关键词匹配的有效答案字符串。
+    """
+    if not is_question_mode:
+        return comment  # 普通模式，直接返回原文
+
+    # 问题模式下，尝试解析
+    answer_separator = "答案："
+    if answer_separator in comment:
+        try:
+            # 分割字符串，并取“答案：”后面的部分
+            answer = comment.split(answer_separator, 1)[1].strip()
+            return answer
+        except IndexError:
+            # "答案：" 存在但后面没有内容，返回空字符串
+            return ""
+    
+    # 如果问题模式开启，但消息格式不符，则返回原始消息作为兜底
+    return comment
+
+
 async def process_join_request(data: Dict[str, Any]):
     """核心业务：处理加群申请事件。"""
     group_id = data.get('group_id')
@@ -192,11 +233,19 @@ async def process_join_request(data: Dict[str, Any]):
         logger.debug(f"忽略来自非目标群 {group_id} 的申请。")
         return
 
+    # 获取原始验证消息
     comment = data.get("comment", "")
-    logger.info(f"处理用户 {user_id} 对目标群 {group_id} 的申请。验证消息: '{comment}'")
+    logger.info(f"处理用户 {user_id} 对目标群 {group_id} 的申请。原始验证消息: '{comment}'")
 
-    if comment in config.allowed_comments:
-        logger.info(f"用户 {user_id} 使用了暗号 '{comment}'，自动通过。")
+    # 根据配置提取有效答案用于匹配
+    effective_answer = extract_answer_from_comment(comment, config.question_mode_enabled)
+    
+    # 如果提取出的答案与原文不同，打印日志以供调试
+    if effective_answer != comment:
+        logger.info(f"问题模式已启用，提取出的答案为: '{effective_answer}'")
+
+    if effective_answer in config.allowed_comments:
+        logger.info(f"用户 {user_id} 使用了暗号 '{effective_answer}'，自动通过。")
         await api_client.handle_group_add_request(flag, True)
         return
 
@@ -206,6 +255,7 @@ async def process_join_request(data: Dict[str, Any]):
     async with _pending_requests_lock:
         PENDING_REQUESTS[user_id] = {"flag": flag, "group_id": group_id, "nickname": nickname}
     
+    # 通知管理员时，发送完整的原始验证消息，保留上下文
     notification_message = (
         f"【加群待审核】\n"
         f"申请群聊: {group_id}\n"
@@ -351,6 +401,8 @@ async def main():
     logger.info(f"HTTP API 地址: {config.onebot_http_api_url}")
     logger.info(f"目标处理群组: {config.target_group_ids or '未配置'}")
     logger.info(f"管理员通知群组: {config.admin_group_ids or '未配置'}")
+    # 新增：在启动时打印问题模式的状态
+    logger.info(f"问题回答模式: {'已启用' if config.question_mode_enabled else '已禁用'}")
 
     # 启动后台状态同步任务
     sync_task = asyncio.create_task(sync_pending_requests_status())
