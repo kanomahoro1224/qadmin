@@ -283,8 +283,9 @@ async def process_command_message(data: Dict[str, Any]):
     logger.debug(f"收到群消息事件: {data}")
 
     if data.get('sender', {}).get('role') not in ('owner', 'admin'):
-        logger.debug("消息发送者非管理员，忽略。")
-        return
+        #logger.debug("消息发送者非管理员，忽略。")
+        #return
+        logger.debug("消息发送者非管理员，但仍继续执行（なつき也不知道为什么反正产品要求是这样）")
     
     sender_group_id = data.get("group_id")
     if sender_group_id not in config.admin_group_ids:
